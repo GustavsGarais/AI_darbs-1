@@ -13,7 +13,7 @@ class Config:
     
     # Default Models
     # Text extraction/summarization model (Hugging Face)
-    TEXT_EXTRACTION_MODEL = "facebook/bart-large-cnn"
+    TEXT_EXTRACTION_MODEL = "sshleifer/distilbart-cnn-12-6"  # Smaller, more accessible model
     
     # OpenAI model for text generation (keywords and questions)
     OPENAI_MODEL = "gpt-3.5-turbo"

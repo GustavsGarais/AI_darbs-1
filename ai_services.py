@@ -34,26 +34,31 @@ class AIService:
             try:
                 response = self.hf_client.summarization(
                     text_to_summarize,
-                    model=Config.TEXT_EXTRACTION_MODEL,
-                    parameters={
-                        "max_length": 150,
-                        "min_length": 50,
-                        "do_sample": False
-                    }
+                    model=Config.TEXT_EXTRACTION_MODEL
                 )
-                summary = response.summary_text if hasattr(response, 'summary_text') else str(response)
+                
+                if isinstance(response, str):
+                    summary = response
+                elif isinstance(response, list) and len(response) > 0:
+                    if isinstance(response[0], dict) and 'summary_text' in response[0]:
+                        summary = response[0]['summary_text']
+                    elif isinstance(response[0], str):
+                        summary = response[0]
+                    else:
+                        summary = str(response[0])
+                else:
+                    summary = str(response)
+                
                 if summary and len(summary) > 20:
                     return summary
             except Exception as e:
                 print(f"⚠ Hugging Face summarization failed: {str(e)}")
             
-            # Fallback: use Hugging Face text generation
-            print("  Using Hugging Face text generation as fallback...")
-            response = self.hf_client.text_generation(
-                f"Summarize in 2-3 sentences: {text_to_summarize}",
-                model="mistralai/Mistral-7B-Instruct-v0.2",
-                max_new_tokens=200,
-                temperature=0.3
+            print("  Using alternative summarization model as fallback...")
+            # Try with a different, more accessible model
+            response = self.hf_client.summarization(
+                text_to_summarize,
+                model="Falconsai/text_summarization"  # Alternative summarization model
             )
             
             summary = response.strip()
@@ -151,19 +156,33 @@ Keywords:"""
             print("  Using fallback keyword extraction...")
             keywords = []
             
-            # Get numbers with units
-            number_matches = re.findall(r'\b(\d+(?:,\d{3})*(?:\.\d+)?)\s+([a-zA-Z]+)\b', text)
-            for num, unit in number_matches[:num_keywords]:
-                keywords.append(Keyword(word=f"{num} {unit}"))
+            # Initialize empty keywords list
+            keywords = []
             
-            # Get capitalized words
-            capitalized = re.findall(r'\b[A-Z][a-z]+\b', text)
-            unique_caps = list(dict.fromkeys(capitalized))
-            for cap in unique_caps:
-                if len(keywords) >= num_keywords:
-                    break
-                if len(cap) > 3:
-                    keywords.append(Keyword(word=cap))
+            # Get dates and years
+            date_matches = re.findall(r'\b(\d{4})\b|\b(\d{1,2}(?:st|nd|rd|th)?\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)(?:\s+\d{4})?)\b', text)
+            for match in date_matches:
+                date = next(d for d in match if d)  # Get non-empty group
+                if date not in [k.word for k in keywords]:
+                    keywords.append(Keyword(word=date))
+            
+            # Get measurements with units
+            measurement_matches = re.findall(r'\b(\d+(?:,\d{3})*(?:\.\d+)?)\s+(?:meters?|feet|kilometers?|miles|tons?|kg|pounds?|euros?|dollars?)\b', text, re.IGNORECASE)
+            for match in measurement_matches:
+                if match not in [k.word for k in keywords]:
+                    keywords.append(Keyword(word=match))
+            
+            # Get proper nouns (names, places, etc.)
+            proper_nouns = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', text)
+            for noun in proper_nouns:
+                if len(noun) > 3 and noun not in [k.word for k in keywords]:
+                    keywords.append(Keyword(word=noun))
+            
+            # Get technical or specific terms (words followed by explanations)
+            technical_terms = re.findall(r'\b([A-Za-z]+(?:-[A-Za-z]+)*)\s+(?:is|are|was|were|refers to|means|defined as)\b', text)
+            for term in technical_terms:
+                if len(term) > 3 and term not in [k.word for k in keywords]:
+                    keywords.append(Keyword(word=term))
             
             return keywords[:num_keywords]
     
@@ -304,27 +323,68 @@ Correct: [A, B, C, or D]"""
         return text[:500]
     
     def _create_keyword_question(self, keyword: str, context: str) -> Question:
-        """Create a simple fallback question about a specific keyword"""
-        if any(char.isdigit() for char in keyword):
-            question_text = f"What is the significance of {keyword} mentioned in the text?"
-            correct_option = f"{keyword} as described in the passage"
-        elif keyword[0].isupper():
-            question_text = f"What is {keyword} according to the text?"
-            correct_option = f"{keyword} as explained in the passage"
-        else:
-            question_text = f"What role does '{keyword}' play in the text?"
-            correct_option = f"'{keyword}' is a key concept in the text"
-        
+        """Create a more sophisticated fallback question about a specific keyword"""
+        # Find the sentence containing the keyword
+        keyword_lower = keyword.lower()
+        sentences = [s.strip() for s in context.split('.') if s.strip()]
+        relevant_sentence = next((s for s in sentences if keyword_lower in s.lower()), '')
+
+        if not relevant_sentence:
+            return self._create_fallback_question(keyword)
+
+        # Determine question type based on keyword characteristics
+        if re.search(r'\b\d{4}\b', keyword):  # Year
+            question_text = f"What significant event occurred in {keyword}?"
+            correct_option = relevant_sentence
+            wrong_options = [
+                f"Planning phase began in {keyword}",
+                f"Initial designs were completed in {keyword}",
+                f"Major modifications were made in {keyword}"
+            ]
+        elif re.search(r'\b\d+\s*(?:meters?|m|feet|ft)\b', keyword, re.I):  # Measurement
+            question_text = f"What does the measurement {keyword} refer to?"
+            correct_option = relevant_sentence
+            wrong_options = [
+                "It was the initial planned size",
+                "It was the size after modifications",
+                "It represents a different dimension"
+            ]
+        elif keyword[0].isupper():  # Proper noun
+            question_text = f"What is stated about {keyword} in the text?"
+            correct_option = relevant_sentence
+            wrong_options = [
+                "It was involved in a different way",
+                "It had a minor role in the events",
+                "It was referenced differently"
+            ]
+        else:  # Other keywords
+            question_text = f"What does the text say about {keyword}?"
+            correct_option = relevant_sentence
+            wrong_options = [
+                "It had a different significance",
+                "It was mentioned in another context",
+                "It played a different role"
+            ]
+
         return Question(
             question_text=question_text,
+            options=[correct_option] + wrong_options,
+            correct_answer=0,
+            explanation=f"This is directly stated in the text: {relevant_sentence}"
+        )
+
+    def _create_fallback_question(self, keyword: str) -> Question:
+        """Create a basic question when no context is found"""
+        return Question(
+            question_text=f"What is mentioned about {keyword} in the text?",
             options=[
-                correct_option,
-                "It is not mentioned in the text",
-                "It refers to something unrelated",
-                "It is only briefly mentioned"
+                "It was an important element discussed",
+                "It was not directly relevant",
+                "It had a minor significance",
+                "It was only briefly mentioned"
             ],
             correct_answer=0,
-            explanation=f"Based on the discussion of {keyword} in the text"
+            explanation=f"The text mentions {keyword} as an important element"
         )
     
     def _parse_question(self, response: str) -> Question:
